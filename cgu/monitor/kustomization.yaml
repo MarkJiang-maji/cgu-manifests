@@ -8,3 +8,4 @@ kind: Kustomization
 # override the patch applied in base_v3
 resources:
 - prom.yaml
+- v71

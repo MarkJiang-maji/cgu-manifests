@@ -1,0 +1,23 @@
+# Only for clusters WITHOUT the v53 monitor (cgu/monitor/prom.yaml).
+# v53's ServiceMonitor "node-resource-monitor" selects app=prom-app, which
+# already matches service/prom-app-v71. Applying this as well would scrape
+# v71 twice and produce duplicate series.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: node-resource-monitor-v71
+  namespace: cgu
+  labels:
+    release: kube-prom-stack
+    monitor_version: v71
+spec:
+  selector:
+    matchLabels:
+      app: prom-app
+      monitor_version: v71
+  namespaceSelector:
+    matchNames:
+      - cgu
+  endpoints:
+    - port: metrics
+      interval: 60s

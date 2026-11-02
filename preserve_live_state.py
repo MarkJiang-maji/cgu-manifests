@@ -29,6 +29,9 @@ import yaml
 CREATE_ONLY = {
     ("ConfigMap", "kubeflow", "kubeflow-announcements"),
     ("ConfigMap", "kubeflow", "qnap-config"),
+    # Billing rates are edited from the AI_Centre_Admin web page.
+    ("ConfigMap", "cgu", "node-resource-monitor-config"),
+    ("ConfigMap", "cgu", "node-resource-monitor-config-v71"),
 }
 WEBHOOK_KINDS = {"MutatingWebhookConfiguration", "ValidatingWebhookConfiguration"}
 RULES_OWNED_BY_CONTROLLER = (".knative.dev",)  # webhook configuration name suffixes
