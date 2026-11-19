@@ -52,8 +52,10 @@ spec:
               value: "1"
             - name: EXPORTER_VERSION
               value: "v71"
-            - name: LEGACY_BOOTSTRAP_URL
-              value: http://prom-app.cgu.svc.cluster.local:8080/metrics
+            # Restores the in-memory namespace_*_cost* counters after a restart from
+            # this exporter's own last values in Prometheus (see README.md).
+            - name: LEGACY_BOOTSTRAP_PROMETHEUS_URL
+              value: http://kube-prom-stack-kube-prome-prometheus.prometheus.svc.cluster.local:9090
             - name: LOG_LEVEL
               valueFrom:
                 configMapKeyRef:

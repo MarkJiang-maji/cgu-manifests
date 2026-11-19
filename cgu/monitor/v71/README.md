@@ -1,7 +1,7 @@
 # CGU Monitor v71（計費 exporter）部署說明
 
 v71 exporter 依每個使用者 namespace 的 CPU / GPU request 計算用量與費用，提供給 AI_Centre_Admin 前端（Home / User 頁）使用。
-上一層的 `cgu/monitor/`（`prom.py`、`markjiang10/cgu-monitor:v53`）是舊版 v53；v71 不取代它，可以並存。
+舊版 v53（`markjiang10/cgu-monitor:v53`）已於 2026-11-20 停用，由 v71 取代；還在跑 v53 的叢集照下方「移除 v53」處理。
 
 指標與設計說明見 [README_v2.md](README_v2.md)，與 v53 的數值比對見 [validation_v71.md](validation_v71.md)。
 
@@ -15,7 +15,7 @@ v71 exporter 依每個使用者 namespace 的 CPU / GPU request 計算用量與�
 | `prom_v2.yaml` | 費率 ConfigMap、Deployment、Service（含 NodePort 30071）、ServiceAccount、RBAC |
 | `prom_rules_v2.yaml` | recording rules，與 .6 線上相同 |
 | `apply-prometheus-settings.sh` | 設定 Prometheus 的 NodePort 32049 與保留 360 天（.6 目前維持 180 天，不要在 .6 加 `CONFIRM_DATA_LOSS=yes` 執行） |
-| `servicemonitor-v71.yaml` | 只有在**沒有** v53 的叢集才套用，見下方 |
+| `servicemonitor-v71.yaml` | Prometheus 抓取 v71 用的 ServiceMonitor（已包含在 `kustomization.yaml`） |
 | `kube-prom-stack-retention-180d.yaml` | .25 用過的 helm values。**.4、.6 不要用**：50Gi 放不下 180 天的資料，而且 Prometheus 官方不支援 NFS |
 | `test_prom_v2.py` | 單元測試 |
 | `validate_prom_v2.py` | 比對 v53 與 v71 `/metrics` 的工具 |
@@ -36,29 +36,49 @@ bash cgu/monitor/v71/apply-prometheus-settings.sh
 ```
 
 - 一定要經過 `preserve_live_state.py`，否則會把網頁上改過的費率蓋回初始值。
-- 只動 v71，不動 v53。v71 啟動時要從 v53 載入累積費用，v53 要繼續跑。
+- v71 不再依賴 v53：抓取用自己的 ServiceMonitor，累積費用從 Prometheus 接續（見下方「累積費用」）。
 - Prometheus 沒有 PVC 時，改保留天數會重建 pod 並清掉所有資料，腳本會先停下來；確認可接受後加 `CONFIRM_DATA_LOSS=yes` 再跑。
 - 完整的 `apply.sh` 也會裝 v71（`cgu/monitor/kustomization.yaml` 已包含），但它還會動到其他元件，只更新 monitor 時不要用。
 
-### 叢集上沒有 v53 時
+### 累積費用（`namespace_*_cost*`）
 
-1. Prometheus 抓不到 v71：v71 是靠 v53 的 ServiceMonitor（selector `app: prom-app`）被抓取的，要另外套用：
+這四個累積值只存在 exporter 記憶體裡。啟動時 v71 會向本叢集的 Prometheus（`LEGACY_BOOTSTRAP_PROMETHEUS_URL`）查自己過去 30 天的最高值接著累積：
 
-   ```bash
-   kubectl apply -f servicemonitor-v71.yaml
-   ```
+```
+max by (exported_namespace) (max_over_time(namespace_cpu_cost{service="prom-app-v71"}[30d]))
+```
 
-   已經有 v53 的叢集（.6、.25）**不要**套用，否則會重複抓取。
+- 累積值只增不減，最高值就是重啟前最後的值；舊 pod 的 series 被標成 stale 也查得到。
+- Prometheus 暫時連不上時，每分鐘重試；期間先從 0 累積，接上後加在查到的值上，不會覆蓋。
+- 新叢集查不到歷史時從 0 開始，視為成功，不會一直重試。
+- `cgu_monitor_legacy_bootstrap_success` 為 1 表示已接續。
+- 可調整：`LEGACY_BOOTSTRAP_SERVICE`（預設 `prom-app-v71`）、`LEGACY_BOOTSTRAP_LOOKBACK`（預設 `30d`）、`LEGACY_BOOTSTRAP_TIMEOUT_SECONDS`（預設 30）。
+- 沒設 `LEGACY_BOOTSTRAP_PROMETHEUS_URL` 時才使用 `LEGACY_BOOTSTRAP_URL`（某個 `/metrics` 網址，例如舊 v53）；兩個都沒設就從 0 開始。
+- Prometheus 沒有 PVC，Prometheus pod 重建時歷史資料連同這些累積值都會消失。
 
-2. `prom_v2.yaml` 的 `LEGACY_BOOTSTRAP_URL` 指向 v53 的 `prom-app`，用來在啟動時接續 v53 的累積費用。
-   沒有 v53 時，exporter 仍會正常運作，累積值從 0 開始，但每分鐘會記一筆 warning。可以把它設成空字串關掉：
+AI_Centre_Admin 首頁的計費（`cgu_namespace_billable_*`）是對 Prometheus 歷史積分，不使用這四個累積值。
 
-   ```yaml
-   - name: LEGACY_BOOTSTRAP_URL
-     value: ""
-   ```
+### 移除 v53（還在跑 v53 的叢集，例如 2026-11 的 .4、.6）
 
-   注意：累積費用只存在記憶體裡。沒有 v53 可接續時，Pod 重啟後 `namespace_*_cost*` 會從 0 重新累積。
+`kubectl apply` 不會刪掉 repo 已移除的物件，要手動刪。先套用 v71（新增 ServiceMonitor、改接續來源，v71 pod 會重啟一次），確認接續成功後再刪 v53：
+
+```bash
+kustomize build cgu/monitor/v71 | python3 preserve_live_state.py | kubectl diff -f -
+kustomize build cgu/monitor/v71 | python3 preserve_live_state.py | kubectl apply -f -
+kubectl rollout status deploy/node-resource-monitor-v71 -n cgu --timeout=300s
+kubectl logs -n cgu deploy/node-resource-monitor-v71 | grep 'Loaded cost bootstrap'   # 應有「Loaded cost bootstrap for N namespaces」
+
+kubectl -n cgu delete servicemonitor node-resource-monitor          # v53 的，selector app=prom-app 也會抓到 v71
+kubectl -n cgu delete deploy node-resource-monitor
+kubectl -n cgu delete svc prom-app node-resource-monitor
+kubectl -n cgu delete sa prom-service-account
+kubectl delete clusterrolebinding node-access-binding
+kubectl delete clusterrole node-access
+```
+
+- 兩個 ServiceMonitor 同時存在的那一兩分鐘，v71 會被抓兩次（同樣的 label），Prometheus 只會記錄 duplicate sample 警告。
+- v53 的舊資料留在 Prometheus，到保留期限才消失；刪掉 v53 不會刪歷史。
+- 只有 v53 用到的補丁也可刪除，例如 .4 的 ConfigMap `node-resource-monitor-fix`（v53 的 kubernetes 12.0.1 遇到沒有 tag 的節點 image 會 crash；v71 用 26.1.0，沒有這個問題）。
 
 ## 費率
 
@@ -82,9 +102,9 @@ Prometheus 上應查得到 `up{service="prom-app-v71"} == 1`，以及 `namespace
 ConfigMap 會從 `prom_v2.py` 自動產生，但更新它不會重啟 pod，要自己 restart：
 
 ```bash
-python3 -m unittest test_prom_v2          # 需要 kubernetes==26.1.0、prometheus-client==0.20.0
+(cd cgu/monitor/v71 && python3 -m unittest test_prom_v2)   # 需要 kubernetes==26.1.0、prometheus-client==0.20.0
 kustomize build cgu/monitor/v71 | python3 preserve_live_state.py | kubectl apply -f -
 kubectl rollout restart deploy/node-resource-monitor-v71 -n cgu
 ```
 
-重啟 exporter 不會影響 Prometheus 裡的歷史資料，但 `namespace_*_cost*` 累積值存在記憶體裡，重啟後會從 v53 重新載入，數值會跳動。`cgu_namespace_billable_*` 不受影響。
+重啟 exporter 不會影響 Prometheus 裡的歷史資料；`namespace_*_cost*` 累積值重啟後會從 Prometheus 接續（見「累積費用」）。`cgu_namespace_billable_*` 不受影響。

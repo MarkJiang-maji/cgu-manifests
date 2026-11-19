@@ -1,7 +1,6 @@
-# Only for clusters WITHOUT the v53 monitor (cgu/monitor/prom.yaml).
-# v53's ServiceMonitor "node-resource-monitor" selects app=prom-app, which
-# already matches service/prom-app-v71. Applying this as well would scrape
-# v71 twice and produce duplicate series.
+# Prometheus scrapes v71 through this ServiceMonitor. Until 2026-11-20 it was scraped
+# through v53's ServiceMonitor "node-resource-monitor" (selector app=prom-app); keep only
+# one of the two, or every v71 series is scraped twice.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
