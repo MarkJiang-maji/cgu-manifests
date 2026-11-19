@@ -1,8 +1,10 @@
+import json
 import logging
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -30,9 +32,22 @@ PROFILE_PLURAL = os.getenv("PROFILE_PLURAL", "profiles")
 DEFAULT_CPU_COST_PER_MINUTE = float(os.getenv("DEFAULT_CPU_COST_PER_MINUTE", "0.03"))
 DEFAULT_GPU_COST_PER_MINUTE = float(os.getenv("DEFAULT_GPU_COST_PER_MINUTE", "0.7"))
 COST_CONFIG_PATH = os.getenv("COST_CONFIG_PATH", "/etc/node-resource-monitor")
-LEGACY_BOOTSTRAP_URL = os.getenv("LEGACY_BOOTSTRAP_URL", "http://120.126.23.25:30044/metrics")
+# Where the cumulative namespace_*_cost* counters are restored from after a restart
+# (they live only in memory). Preferred: this cluster's Prometheus, reading back v71's
+# own last values. LEGACY_BOOTSTRAP_URL (a /metrics page, e.g. the old v53 exporter)
+# is used only when no Prometheus URL is set. Neither set: counters start at 0.
+LEGACY_BOOTSTRAP_PROMETHEUS_URL = os.getenv("LEGACY_BOOTSTRAP_PROMETHEUS_URL", "").rstrip("/")
+LEGACY_BOOTSTRAP_SERVICE = os.getenv("LEGACY_BOOTSTRAP_SERVICE", "prom-app-v71")
+LEGACY_BOOTSTRAP_LOOKBACK = os.getenv("LEGACY_BOOTSTRAP_LOOKBACK", "30d")
+LEGACY_BOOTSTRAP_URL = os.getenv("LEGACY_BOOTSTRAP_URL", "")
 LEGACY_BOOTSTRAP_TIMEOUT_SECONDS = float(
-    os.getenv("LEGACY_BOOTSTRAP_TIMEOUT_SECONDS", "5.0")
+    os.getenv("LEGACY_BOOTSTRAP_TIMEOUT_SECONDS", "30.0")
+)
+LEGACY_COST_METRICS = (
+    "namespace_cpu_cost",
+    "namespace_gpu_cost",
+    "namespace_cpu_cost_time",
+    "namespace_gpu_cost_time",
 )
 
 NOTEBOOK_LABEL_KEYS = (
@@ -283,7 +298,65 @@ def fetch_metric_samples_from_text(
     return parsed
 
 
-def fetch_legacy_metric_samples() -> Dict[str, Dict[Tuple[Tuple[str, str], ...], float]]:
+def build_bootstrap_query(metric_name: str, service: str, lookback: str) -> str:
+    # The counters only grow, so the highest value in the window is the last one
+    # before the restart, and it survives Prometheus marking the old pod's series stale.
+    # Prometheus stores the exporter's `namespace` label as `exported_namespace`.
+    return (
+        f'max by (exported_namespace) (max_over_time({metric_name}{{service="{service}"}}[{lookback}]))'
+    )
+
+
+def fetch_prometheus_bootstrap_samples(
+    prometheus_url: str,
+    service: str,
+    lookback: str,
+    timeout: float,
+) -> Optional[Dict[str, Dict[Tuple[Tuple[str, str], ...], float]]]:
+    """Return {metric: {(("namespace", ns),): value}}, or None if Prometheus could not answer.
+
+    An empty result (a new cluster with no history yet) is a successful answer.
+    """
+    parsed: Dict[str, Dict[Tuple[Tuple[str, str], ...], float]] = {}
+    try:
+        for metric_name in LEGACY_COST_METRICS:
+            query = urllib.parse.urlencode(
+                {"query": build_bootstrap_query(metric_name, service, lookback)}
+            )
+            with urllib.request.urlopen(
+                f"{prometheus_url}/api/v1/query?{query}", timeout=timeout
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if payload.get("status") != "success":
+                raise ValueError(f"Prometheus query failed: {payload.get('error')}")
+            values: Dict[Tuple[Tuple[str, str], ...], float] = {}
+            for item in payload.get("data", {}).get("result", []):
+                namespace = item.get("metric", {}).get("exported_namespace")
+                if namespace:
+                    values[(("namespace", namespace),)] = float(item["value"][1])
+            parsed[metric_name] = values
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError) as exc:
+        LOGGER.warning("Failed to load cost bootstrap from Prometheus %s: %s", prometheus_url, exc)
+        return None
+    LOGGER.info(
+        "Loaded cost bootstrap for %d namespaces from Prometheus %s (service=%s, lookback=%s).",
+        len(parsed.get("namespace_cpu_cost", {})),
+        prometheus_url,
+        service,
+        lookback,
+    )
+    return parsed
+
+
+def fetch_legacy_metric_samples() -> Optional[Dict[str, Dict[Tuple[Tuple[str, str], ...], float]]]:
+    """Cumulative cost samples to resume from; None means "source unreachable, retry later"."""
+    if LEGACY_BOOTSTRAP_PROMETHEUS_URL:
+        return fetch_prometheus_bootstrap_samples(
+            LEGACY_BOOTSTRAP_PROMETHEUS_URL,
+            LEGACY_BOOTSTRAP_SERVICE,
+            LEGACY_BOOTSTRAP_LOOKBACK,
+            LEGACY_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
     if not LEGACY_BOOTSTRAP_URL:
         return {}
     try:
@@ -293,18 +366,10 @@ def fetch_legacy_metric_samples() -> Dict[str, Dict[Tuple[Tuple[str, str], ...],
         ) as response:
             body = response.read().decode("utf-8")
         LOGGER.info("Loaded legacy bootstrap metrics from %s.", LEGACY_BOOTSTRAP_URL)
-        return fetch_metric_samples_from_text(
-            body,
-            {
-                "namespace_cpu_cost",
-                "namespace_gpu_cost",
-                "namespace_cpu_cost_time",
-                "namespace_gpu_cost_time",
-            },
-        )
+        return fetch_metric_samples_from_text(body, set(LEGACY_COST_METRICS))
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         LOGGER.warning("Failed to load legacy bootstrap metrics from %s: %s", LEGACY_BOOTSTRAP_URL, exc)
-        return {}
+        return None
 
 
 def bootstrap_legacy_cost_state(
@@ -316,28 +381,31 @@ def bootstrap_legacy_cost_state(
         return True
 
     samples = fetch_legacy_metric_samples()
-    if not samples and LEGACY_BOOTSTRAP_URL:
+    if samples is None:
         return False
+
+    # Until now the state holds only what accrued since this process started (from 0
+    # while the source was unreachable), so add it on top of the restored totals.
 
     for labels, value in samples.get("namespace_cpu_cost", {}).items():
         namespace = dict(labels).get("namespace")
         if namespace:
-            legacy_cost_state.cpu_cost[namespace] = value
+            legacy_cost_state.cpu_cost[namespace] = value + legacy_cost_state.cpu_cost.get(namespace, 0.0)
 
     for labels, value in samples.get("namespace_gpu_cost", {}).items():
         namespace = dict(labels).get("namespace")
         if namespace:
-            legacy_cost_state.gpu_cost[namespace] = value
+            legacy_cost_state.gpu_cost[namespace] = value + legacy_cost_state.gpu_cost.get(namespace, 0.0)
 
     for labels, value in samples.get("namespace_cpu_cost_time", {}).items():
         namespace = dict(labels).get("namespace")
         if namespace:
-            legacy_cost_state.cpu_cost_time[namespace] = value
+            legacy_cost_state.cpu_cost_time[namespace] = value + legacy_cost_state.cpu_cost_time.get(namespace, 0.0)
 
     for labels, value in samples.get("namespace_gpu_cost_time", {}).items():
         namespace = dict(labels).get("namespace")
         if namespace:
-            legacy_cost_state.gpu_cost_time[namespace] = value
+            legacy_cost_state.gpu_cost_time[namespace] = value + legacy_cost_state.gpu_cost_time.get(namespace, 0.0)
 
     if cpu_cost_per_minute > 0:
         for namespace, value in legacy_cost_state.cpu_cost.items():

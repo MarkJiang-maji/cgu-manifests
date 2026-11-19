@@ -1,4 +1,8 @@
+import json
 import unittest
+import urllib.error
+import urllib.parse
+from unittest import mock
 
 import prom_v2 as prom
 
@@ -141,6 +145,114 @@ class LegacyBootstrapTests(unittest.TestCase):
         prom.build_snapshot([], [], [], [], 2.0, 10.0, state, now_monotonic=100.0)
         self.assertEqual(state.cpu_cost_time["b1144209"], 60.0)
         self.assertEqual(state.gpu_cost_time["b1128005"], 5.0)
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def prometheus_answer(values_by_metric):
+    """A fake urlopen that answers each bootstrap query from values_by_metric."""
+    seen = []
+
+    def urlopen(url, timeout):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["query"][0]
+        seen.append((url, query, timeout))
+        metric = next(m for m in prom.LEGACY_COST_METRICS if f"({m}{{" in query)
+        result = [
+            {"metric": {"exported_namespace": ns}, "value": [1795105827.1, str(v)]}
+            for ns, v in values_by_metric.get(metric, {}).items()
+        ]
+        return FakeResponse({"status": "success", "data": {"resultType": "vector", "result": result}})
+
+    return urlopen, seen
+
+
+class PrometheusBootstrapTests(unittest.TestCase):
+    def test_query_reads_back_own_series_high_water_mark(self):
+        self.assertEqual(
+            prom.build_bootstrap_query("namespace_gpu_cost", "prom-app-v71", "30d"),
+            'max by (exported_namespace) (max_over_time(namespace_gpu_cost{service="prom-app-v71"}[30d]))',
+        )
+
+    def test_samples_are_keyed_by_exported_namespace(self):
+        urlopen, seen = prometheus_answer(
+            {"namespace_cpu_cost": {"b1144209": 12.5}, "namespace_gpu_cost_time": {"d1300701": 300.0}}
+        )
+        with mock.patch.object(prom.urllib.request, "urlopen", urlopen):
+            samples = prom.fetch_prometheus_bootstrap_samples("http://prom:9090", "prom-app-v71", "30d", 7.0)
+
+        self.assertEqual(samples["namespace_cpu_cost"], {(("namespace", "b1144209"),): 12.5})
+        self.assertEqual(samples["namespace_gpu_cost_time"], {(("namespace", "d1300701"),): 300.0})
+        self.assertEqual(samples["namespace_gpu_cost"], {})
+        self.assertEqual(len(seen), 4)
+        self.assertTrue(all(url.startswith("http://prom:9090/api/v1/query?") for url, _, _ in seen))
+        self.assertTrue(all(timeout == 7.0 for _, _, timeout in seen))
+
+    def test_unreachable_prometheus_is_retried_not_treated_as_empty(self):
+        def unreachable(url, timeout):
+            raise urllib.error.URLError("connection refused")
+
+        state = prom.LegacyCostState()
+        with mock.patch.object(prom, "LEGACY_BOOTSTRAP_PROMETHEUS_URL", "http://prom:9090"), mock.patch.object(
+            prom.urllib.request, "urlopen", unreachable
+        ):
+            self.assertIsNone(prom.fetch_legacy_metric_samples())
+            self.assertFalse(prom.bootstrap_legacy_cost_state(state, 0.03, 0.7))
+        self.assertFalse(state.bootstrapped)
+
+    def test_failed_query_status_is_retried(self):
+        def bad_query(url, timeout):
+            return FakeResponse({"status": "error", "error": "parse error"})
+
+        with mock.patch.object(prom.urllib.request, "urlopen", bad_query):
+            self.assertIsNone(
+                prom.fetch_prometheus_bootstrap_samples("http://prom:9090", "prom-app-v71", "30d", 5.0)
+            )
+
+    def test_new_cluster_without_history_bootstraps_from_zero(self):
+        urlopen, _ = prometheus_answer({})
+        state = prom.LegacyCostState()
+        with mock.patch.object(prom, "LEGACY_BOOTSTRAP_PROMETHEUS_URL", "http://prom:9090"), mock.patch.object(
+            prom.urllib.request, "urlopen", urlopen
+        ):
+            self.assertTrue(prom.bootstrap_legacy_cost_state(state, 0.03, 0.7))
+        self.assertTrue(state.bootstrapped)
+        self.assertEqual(state.cpu_cost, {})
+
+    def test_cost_accrued_before_a_late_bootstrap_is_kept(self):
+        # Prometheus was down at startup, so 2.0 accrued from zero; the restored total adds on top.
+        urlopen, _ = prometheus_answer(
+            {
+                "namespace_cpu_cost": {"b1144209": 100.0},
+                "namespace_cpu_cost_time": {"b1144209": 3000.0},
+            }
+        )
+        state = prom.LegacyCostState(cpu_cost={"b1144209": 2.0}, cpu_cost_time={"b1144209": 60.0})
+        with mock.patch.object(prom, "LEGACY_BOOTSTRAP_PROMETHEUS_URL", "http://prom:9090"), mock.patch.object(
+            prom.urllib.request, "urlopen", urlopen
+        ):
+            self.assertTrue(prom.bootstrap_legacy_cost_state(state, 0.03, 0.7))
+        self.assertEqual(state.cpu_cost["b1144209"], 102.0)
+        self.assertEqual(state.cpu_cost_time["b1144209"], 3060.0)
+
+    def test_no_source_configured_starts_from_zero(self):
+        state = prom.LegacyCostState()
+        with mock.patch.object(prom, "LEGACY_BOOTSTRAP_PROMETHEUS_URL", ""), mock.patch.object(
+            prom, "LEGACY_BOOTSTRAP_URL", ""
+        ):
+            self.assertTrue(prom.bootstrap_legacy_cost_state(state, 0.03, 0.7))
+        self.assertTrue(state.bootstrapped)
 
 
 if __name__ == "__main__":
