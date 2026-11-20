@@ -12,6 +12,7 @@ v71 exporter 依每個使用者 namespace 的 CPU / GPU request 計算用量與�
 | `prom_v2.py` | exporter 原始碼 |
 | `kustomization.yaml` | 把下列資源組起來，並從 `prom_v2.py` 產生 ConfigMap `node-resource-monitor-script-v71` |
 | `monitor-config.yaml` | 費率 ConfigMap `node-resource-monitor-config`（後端費率 API 需要） |
+| `Dockerfile`、`requirements.txt` | monitor image，只有套件 |
 | `prom_v2.yaml` | 費率 ConfigMap、Deployment、Service（含 NodePort 30071）、ServiceAccount、RBAC |
 | `prom_rules_v2.yaml` | recording rules，與 .6 線上相同 |
 | `apply-prometheus-settings.sh` | 設定 Prometheus 的 NodePort 32049 與保留 360 天（.6 目前維持 180 天，不要在 .6 加 `CONFIRM_DATA_LOSS=yes` 執行） |
@@ -24,7 +25,16 @@ v71 exporter 依每個使用者 namespace 的 CPU / GPU request 計算用量與�
 ## 部署
 
 前提：叢集已有 `cgu` namespace、kube-prometheus-stack（ServiceMonitor 需帶 `release: kube-prom-stack`）、Kubeflow `Profile` CRD。
-Pod 啟動時會 `pip install` 套件，節點要能連到 PyPI。
+Pod 用 `docker.io/cguaicadmin/cgu-monitor-v71`，image 只裝好固定版本的套件，啟動不需要連 PyPI。程式 `prom_v2.py` 放在 ConfigMap `node-resource-monitor-script-v71`，改程式只要重新 apply 並重啟 pod，不用重建 image。
+
+只有改 `requirements.txt` 或 Python 版本時才要重建 image（在 `cgu/monitor/v71` 執行，tag 用新的時間）：
+
+```bash
+docker build -t docker.io/cguaicadmin/cgu-monitor-v71:vYYMMDDHHMM .
+docker push docker.io/cguaicadmin/cgu-monitor-v71:vYYMMDDHHMM
+```
+
+之後把 `prom_v2.yaml` 的 `image:` 改成新的 tag。
 
 在 repo 根目錄執行。先看差異，確認後才把 `kubectl diff` 換成 `kubectl apply`：
 

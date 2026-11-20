@@ -31,15 +31,13 @@ spec:
       serviceAccountName: prom-service-account-v71
       containers:
         - name: node-resource-monitor-v71
-          image: python:3.11-slim
+          # Dependencies only (cgu/monitor/v71/Dockerfile); the code is the
+          # node-resource-monitor-script-v71 ConfigMap mounted at /opt/monitor.
+          image: docker.io/cguaicadmin/cgu-monitor-v71:v2611201515
           imagePullPolicy: IfNotPresent
           command:
-            - /bin/sh
-          args:
-            - -c
-            - >-
-              pip install --no-cache-dir kubernetes==26.1.0 prometheus-client==0.20.0 &&
-              python /opt/monitor/prom_v2.py
+            - python
+            - /opt/monitor/prom_v2.py
           ports:
             - containerPort: 8080
               name: metrics
