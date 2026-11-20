@@ -40,6 +40,9 @@ LEGACY_BOOTSTRAP_PROMETHEUS_URL = os.getenv("LEGACY_BOOTSTRAP_PROMETHEUS_URL", "
 LEGACY_BOOTSTRAP_SERVICE = os.getenv("LEGACY_BOOTSTRAP_SERVICE", "prom-app-v71")
 LEGACY_BOOTSTRAP_LOOKBACK = os.getenv("LEGACY_BOOTSTRAP_LOOKBACK", "30d")
 LEGACY_BOOTSTRAP_URL = os.getenv("LEGACY_BOOTSTRAP_URL", "")
+# Bootstrap reads Prometheus as it was when this process started, so the from-zero
+# counters this process exports before a late bootstrap never become the baseline.
+PROCESS_START_TIME = time.time()
 LEGACY_BOOTSTRAP_TIMEOUT_SECONDS = float(
     os.getenv("LEGACY_BOOTSTRAP_TIMEOUT_SECONDS", "30.0")
 )
@@ -104,40 +107,45 @@ def current_cost_settings() -> Tuple[float, float]:
     )
 
 
-def parse_cpu_quantity(raw: Optional[str]) -> float:
-    if not raw:
+# Kubernetes quantity syntax: a number, optional exponent, optional suffix.
+_QUANTITY_RE = re.compile(r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)([A-Za-z]*)$")
+# CPU and other plain quantities, in base units.
+_DECIMAL_SUFFIXES = {
+    "": 1.0, "n": 1e-9, "u": 1e-6, "m": 1e-3,
+    "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
+    "Ki": 2.0**10, "Mi": 2.0**20, "Gi": 2.0**30, "Ti": 2.0**40, "Pi": 2.0**50, "Ei": 2.0**60,
+}
+# Memory in bytes. The decimal letters deliberately count as their binary units
+# (1G == 1Gi), as this exporter always has; only the sub-byte suffixes stay decimal.
+_MEMORY_SUFFIXES = {
+    "": 1.0, "n": 1e-9, "u": 1e-6, "m": 1e-3,
+    "k": 2.0**10, "K": 2.0**10, "M": 2.0**20, "G": 2.0**30, "T": 2.0**40, "P": 2.0**50, "E": 2.0**60,
+    "Ki": 2.0**10, "Mi": 2.0**20, "Gi": 2.0**30, "Ti": 2.0**40, "Pi": 2.0**50, "Ei": 2.0**60,
+}
+_WARNED_QUANTITIES: Set[str] = set()
+
+
+def _parse_quantity(raw: Optional[str], suffixes: Dict[str, float]) -> float:
+    """Parse a Kubernetes quantity; an unparsable value counts as 0 (warned once) so one
+    odd pod or Profile cannot stop the refresh for every namespace."""
+    if raw is None or raw == "":
         return 0.0
-    raw = str(raw).strip()
-    if raw.endswith("m"):
-        return float(raw[:-1]) / 1000.0
-    return float(raw)
+    text = str(raw).strip()
+    match = _QUANTITY_RE.match(text)
+    if match and match.group(2) in suffixes:
+        return float(match.group(1)) * suffixes[match.group(2)]
+    if text not in _WARNED_QUANTITIES:
+        _WARNED_QUANTITIES.add(text)
+        LOGGER.warning("Ignoring unparsable resource quantity %r (counted as 0).", text)
+    return 0.0
+
+
+def parse_cpu_quantity(raw: Optional[str]) -> float:
+    return _parse_quantity(raw, _DECIMAL_SUFFIXES)
 
 
 def parse_memory_to_gib(raw: Optional[str]) -> float:
-    if not raw:
-        return 0.0
-    raw = str(raw).strip()
-    binary_units = {
-        "Ki": 1 / (1024.0 * 1024.0),
-        "Mi": 1 / 1024.0,
-        "Gi": 1.0,
-        "Ti": 1024.0,
-        "Pi": 1024.0 * 1024.0,
-    }
-    decimal_units = {
-        "K": 1 / (1024.0 * 1024.0),
-        "M": 1 / 1024.0,
-        "G": 1.0,
-        "T": 1024.0,
-        "P": 1024.0 * 1024.0,
-    }
-    for suffix, multiplier in binary_units.items():
-        if raw.endswith(suffix):
-            return float(raw[: -len(suffix)]) * multiplier
-    for suffix, multiplier in decimal_units.items():
-        if raw.endswith(suffix):
-            return float(raw[: -len(suffix)]) * multiplier
-    return float(raw) / (1024.0 * 1024.0 * 1024.0)
+    return _parse_quantity(raw, _MEMORY_SUFFIXES) / 2.0**30
 
 
 def iter_gpu_resources(resource_map: Optional[Dict[str, str]]) -> Iterable[Tuple[str, float]]:
@@ -312,6 +320,7 @@ def fetch_prometheus_bootstrap_samples(
     service: str,
     lookback: str,
     timeout: float,
+    evaluation_time: Optional[float] = None,
 ) -> Optional[Dict[str, Dict[Tuple[Tuple[str, str], ...], float]]]:
     """Return {metric: {(("namespace", ns),): value}}, or None if Prometheus could not answer.
 
@@ -320,9 +329,10 @@ def fetch_prometheus_bootstrap_samples(
     parsed: Dict[str, Dict[Tuple[Tuple[str, str], ...], float]] = {}
     try:
         for metric_name in LEGACY_COST_METRICS:
-            query = urllib.parse.urlencode(
-                {"query": build_bootstrap_query(metric_name, service, lookback)}
-            )
+            params = {"query": build_bootstrap_query(metric_name, service, lookback)}
+            if evaluation_time is not None:
+                params["time"] = repr(float(evaluation_time))
+            query = urllib.parse.urlencode(params)
             with urllib.request.urlopen(
                 f"{prometheus_url}/api/v1/query?{query}", timeout=timeout
             ) as response:
@@ -356,6 +366,7 @@ def fetch_legacy_metric_samples() -> Optional[Dict[str, Dict[Tuple[Tuple[str, st
             LEGACY_BOOTSTRAP_SERVICE,
             LEGACY_BOOTSTRAP_LOOKBACK,
             LEGACY_BOOTSTRAP_TIMEOUT_SECONDS,
+            PROCESS_START_TIME,
         )
     if not LEGACY_BOOTSTRAP_URL:
         return {}

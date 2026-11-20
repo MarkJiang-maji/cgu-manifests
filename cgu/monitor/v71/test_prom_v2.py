@@ -20,6 +20,32 @@ class ParseQuantityTests(unittest.TestCase):
         self.assertAlmostEqual(prom.parse_memory_to_gib("1G"), 1.0)
         self.assertAlmostEqual(prom.parse_memory_to_gib("2048M"), 2.0)
 
+    def test_parse_every_valid_kubernetes_quantity(self):
+        self.assertAlmostEqual(prom.parse_memory_to_gib("1k"), 1 / (1024.0 * 1024.0))
+        self.assertAlmostEqual(prom.parse_memory_to_gib("400m"), 0.4 / 1024.0**3)
+        self.assertAlmostEqual(prom.parse_memory_to_gib("1e3"), 1000 / 1024.0**3)
+        self.assertAlmostEqual(prom.parse_memory_to_gib("1.5Gi"), 1.5)
+        self.assertAlmostEqual(prom.parse_memory_to_gib("1Ei"), 1024.0**3)
+        self.assertAlmostEqual(prom.parse_memory_to_gib("1073741824"), 1.0)
+        self.assertAlmostEqual(prom.parse_cpu_quantity("2k"), 2000.0)
+        self.assertAlmostEqual(prom.parse_cpu_quantity("250000u"), 0.25)
+        self.assertAlmostEqual(prom.parse_cpu_quantity("1e-1"), 0.1)
+
+    def test_unparsable_quantity_counts_as_zero_instead_of_raising(self):
+        with self.assertLogs(prom.LOGGER, level="WARNING"):
+            self.assertEqual(prom.parse_memory_to_gib("lots"), 0.0)
+            self.assertEqual(prom.parse_cpu_quantity("1 core"), 0.0)
+
+    def test_one_odd_pod_request_does_not_abort_the_pod(self):
+        container = mock.Mock()
+        container.resources.requests = {"cpu": "1k", "memory": "400m", "nvidia.com/gpu": "1"}
+        pod = mock.Mock()
+        pod.spec.containers = [container]
+        cpu, memory_gib, gpus = prom.collect_pod_requests(pod)
+        self.assertEqual(cpu, 1000.0)
+        self.assertAlmostEqual(memory_gib, 0.4 / 1024.0**3)
+        self.assertEqual(gpus, {"nvidia.com/gpu": 1.0})
+
     def test_iter_gpu_resources(self):
         resources = dict(prom.iter_gpu_resources({"nvidia.com/gpu": "2", "cpu": "1"}))
         self.assertEqual(resources, {"nvidia.com/gpu": 2.0})
@@ -198,6 +224,24 @@ class PrometheusBootstrapTests(unittest.TestCase):
         self.assertEqual(len(seen), 4)
         self.assertTrue(all(url.startswith("http://prom:9090/api/v1/query?") for url, _, _ in seen))
         self.assertTrue(all(timeout == 7.0 for _, _, timeout in seen))
+
+    def test_bootstrap_reads_prometheus_as_of_process_start(self):
+        # Samples scraped from this process after it started must not become the baseline,
+        # or a late bootstrap would add its own accrual twice.
+        urlopen, seen = prometheus_answer({})
+        with mock.patch.object(prom.urllib.request, "urlopen", urlopen):
+            prom.fetch_prometheus_bootstrap_samples("http://prom:9090", "prom-app-v71", "30d", 5.0, 1795105800.25)
+        times = {urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["time"][0] for url, _, _ in seen}
+        self.assertEqual(times, {"1795105800.25"})
+
+    def test_late_bootstrap_uses_the_process_start_time(self):
+        urlopen, seen = prometheus_answer({})
+        with mock.patch.object(prom, "LEGACY_BOOTSTRAP_PROMETHEUS_URL", "http://prom:9090"), mock.patch.object(
+            prom, "PROCESS_START_TIME", 1795105000.0
+        ), mock.patch.object(prom.urllib.request, "urlopen", urlopen):
+            self.assertTrue(prom.bootstrap_legacy_cost_state(prom.LegacyCostState(), 0.03, 0.7))
+        times = {urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["time"][0] for url, _, _ in seen}
+        self.assertEqual(times, {"1795105000.0"})
 
     def test_unreachable_prometheus_is_retried_not_treated_as_empty(self):
         def unreachable(url, timeout):
