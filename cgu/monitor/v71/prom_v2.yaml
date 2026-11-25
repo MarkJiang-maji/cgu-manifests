@@ -52,8 +52,13 @@ spec:
               value: "v71"
             # Restores the in-memory namespace_*_cost* counters after a restart from
             # this exporter's own last values in Prometheus (see README.md).
+            # prometheus-operated is created by the Prometheus Operator and always listens on
+            # 9090; the kube-prom-stack Service port differs per cluster (.25 uses 32049).
             - name: LEGACY_BOOTSTRAP_PROMETHEUS_URL
-              value: http://kube-prom-stack-kube-prome-prometheus.prometheus.svc.cluster.local:9090
+              value: http://prometheus-operated.prometheus.svc.cluster.local:9090
+            # Each of the four 30d queries takes ~29s on .25 (Prometheus data on NFS).
+            - name: LEGACY_BOOTSTRAP_TIMEOUT_SECONDS
+              value: "120"
             - name: LOG_LEVEL
               valueFrom:
                 configMapKeyRef:

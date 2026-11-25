@@ -59,6 +59,7 @@ max by (exported_namespace) (max_over_time(namespace_cpu_cost{service="prom-app-
 ```
 
 - 累積值只增不減，最高值就是重啟前最後的值；舊 pod 的 series 被標成 stale 也查得到。
+- 連的是 `prometheus-operated:9090`（Prometheus Operator 建立，各叢集都是 9090；`kube-prom-stack-kube-prome-prometheus` 的 port 每台不同，.25 是 32049）。.25 每個查詢約 29 秒，所以 `LEGACY_BOOTSTRAP_TIMEOUT_SECONDS` 設為 120。
 - 查詢時間固定為 pod 啟動的那一刻（Prometheus API 的 `time` 參數），只用啟動前的資料。
 - Prometheus 暫時連不上時，每分鐘重試；期間先從 0 累積，接上後加在查到的值上，不會覆蓋，也不會把這段期間被抓走的值重複算一次。
 - 有 pod 或 Profile 的資源寫法認不得時，log 會出現一次 `Ignoring unparsable resource quantity`，該值當成 0，其他 namespace 照常計費。
