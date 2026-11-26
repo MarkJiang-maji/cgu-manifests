@@ -42,5 +42,6 @@ networking:
   targetPort: 8080
   basePrefix: "/pvcviewers"
   rewrite: "/"
-  timeout: 30s
+  # 2026-11-26 mark: was 30s (Kubeflow default); 0s = no total limit, so long downloads are not cut
+  timeout: 0s
 rwoScheduling: true
